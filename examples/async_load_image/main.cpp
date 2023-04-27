@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include "../common.hpp"
 #include <GLFW/glfw3.h>
+#include <stb_image.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #define MY_VULKAN_VERSION VK_API_VERSION_1_1
 #define ENABLE_DEBUG_MESSENGER
@@ -17,7 +21,7 @@ struct Buffer {
 	VmaAllocationInfo allocInfo;
 };
 
-struct ImageInfo {
+struct Image {
 	VkImage img;
 	VkImageView view;
 	VmaAllocation alloc;
@@ -34,6 +38,19 @@ struct ObjectParams {
 	vec2 translation;
 	vec2 scaleRot_X;
 	vec2 scaleRot_Y;
+};
+
+typedef void (*LoadImageCallback)(void* userPtr, CStr fileName, const Image& img);
+struct LoadTask {
+	CStr fileName;
+	LoadImageCallback callback;
+	void* callback_userPtr;
+};
+struct QueueTransferTask {
+	CStr fileName;
+	Image img;
+	LoadImageCallback callback;
+	void* callback_userPtr;
 };
 
 struct Vk {
@@ -74,7 +91,7 @@ struct Vk {
 
 	Buffer stagingBuffer;
 	VkSampler sampler;
-	ImageInfo blackImg;
+	Image blackImg;
 
 	Buffer uniformBuffer_cameraParams;
 	Buffer uniformBuffer_objectParams;
@@ -88,14 +105,31 @@ struct Vk {
 		Buffer indBuffer;
 	} quad;
 
+	std::thread loaderThread;
+	bool terminateLoaderThread = false;
+	std::vector<LoadTask> loadTasks;
+	std::mutex loadTasks_mutex;
+	std::condition_variable loadTasks_condVar;
+	std::vector<QueueTransferTask> queueTransferTasks;
+	std::mutex queueTransferTasks_mutex;
+
+	DelayedResourceDestructionManager<VkDescriptorSet> delayedDestrMan_descSet;
+
 } vk;
 
 static void onWindowResized(GLFWwindow* window, int w, int h)
 {
-
+	if (w == 0 || h == 0)
+		return;
+	vkDeviceWaitIdle(vk.device);
+	vkh::create_swapChain(vk.swapchain, vk.physicalDevice, vk.device, vk.surface, 2, VK_PRESENT_MODE_FIFO_KHR);
+	for (u32 i = 0; i < vk.swapchain.numImages; i++) {
+		vkDestroyFramebuffer(vk.device, vk.framebuffers[i], nullptr);
+		vk.framebuffers[i] = VK_NULL_HANDLE;
+	}
 }
 
-void recordCmds_copyBufferToImageAndPerformTransitions(VkCommandBuffer cmdBuffer, VkImage image, VkBuffer buffer, u32 w, u32 h)
+static void recordCmds_copyBufferToImage(VkCommandBuffer cmdBuffer, VkImage image, VkBuffer buffer, u32 w, u32 h)
 {
 	const VkImageSubresourceRange subresRange = {
 		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -112,7 +146,7 @@ void recordCmds_copyBufferToImageAndPerformTransitions(VkCommandBuffer cmdBuffer
 		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		.image = vk.blackImg.img,
+		.image = image,
 		.subresourceRange = subresRange,
 	};
 	vkCmdPipelineBarrier(cmdBuffer,
@@ -135,24 +169,158 @@ void recordCmds_copyBufferToImageAndPerformTransitions(VkCommandBuffer cmdBuffer
 		.imageOffset = {0, 0, 0},
 		.imageExtent = {w, h, 1},
 	};
-	vkCmdCopyBufferToImage(cmdBuffer, vk.stagingBuffer.buffer, vk.blackImg.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	vkCmdCopyBufferToImage(cmdBuffer, vk.stagingBuffer.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
 
+static void recordCmd_imageQueueFamilyTransfer(VkCommandBuffer cmdBuffer, VkImage img, u32 srcFamily, u32 dstFamily)
+{
+	const VkImageMemoryBarrier imgBarrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.srcQueueFamilyIndex = srcFamily,
+		.dstQueueFamilyIndex = dstFamily,
+		.image = img,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+	vkCmdPipelineBarrier(cmdBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0,
+		0, nullptr,
+		0, nullptr,
+		1, &imgBarrier
+	);
+}
+
+static void recordCmd_transitionImageLayoutToShaderReadOnlyOptimal(VkCommandBuffer cmdBuffer, VkImage img)
+{
 	// transition the image to the SHADER_READ_ONLY_OPTIMAL layout
-	const VkImageMemoryBarrier imgBarrier_1 = {
+	const VkImageMemoryBarrier imgBarrier = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		.image = vk.blackImg.img,
-		.subresourceRange = subresRange,
+		.image = img,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
 	};
 	vkCmdPipelineBarrier(cmdBuffer,
 		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		0,
 		0, nullptr,
 		0, nullptr,
-		1, &imgBarrier_1);
+		1, &imgBarrier);
+}
+
+static void loaderThreadFn()
+{
+	VkCommandBuffer cmdBuffer;
+	vkh::allocateCmdBuffers(vk.device, vk.cmdPool_transfer, { &cmdBuffer, 1 });
+	const VkFence fence = vkh::createFence(vk.device, false);
+
+	while (true)
+	{
+		std::unique_lock loadTasks_lock(vk.loadTasks_mutex);
+		vk.loadTasks_condVar.wait(loadTasks_lock, [](){ return vk.loadTasks.size() > 0 || vk.terminateLoaderThread; });
+		if (vk.terminateLoaderThread)
+			break;
+
+		auto task = vk.loadTasks.back();
+		vk.loadTasks.pop_back();
+		loadTasks_lock.unlock();
+
+		int w, h, nc;
+		u8* data = stbi_load(task.fileName, &w, &h, &nc, 4);
+		// simulate slower load times
+		//std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+		vkh::ImgInfo info = {
+			.width = u32(w),
+			.height = u32(h),
+			.mipLevels = 1,
+		};
+		Image img;
+		vkh::createImage_texture(vk.device, vk.allocator, info, img.img, img.alloc, &img.allocInfo, &img.view);
+
+		assert(4 * w * h < vk.stagingBuffer.allocInfo.size);
+		memcpy(vk.stagingBuffer.allocInfo.pMappedData, data, 4 * w * h);
+		vmaFlushAllocation(vk.allocator, vk.stagingBuffer.alloc, 0, VK_WHOLE_SIZE);
+
+		vkh::beginCmdBuffer(cmdBuffer, true);
+		recordCmds_copyBufferToImage(cmdBuffer, img.img, vk.stagingBuffer.buffer, w, h);
+		recordCmd_imageQueueFamilyTransfer(cmdBuffer, img.img, vk.queueFamily_transfer, vk.queueFamily_main);
+		vkEndCommandBuffer(cmdBuffer);
+
+		vkh::submit(vk.queue_transfer, { &cmdBuffer, 1 }, {}, {}, {}, fence);
+
+		vkWaitForFences(vk.device, 1, &fence, VK_FALSE, -1);
+
+		{
+			std::lock_guard queueTransferTasks_lock(vk.queueTransferTasks_mutex);
+			vk.queueTransferTasks.push_back({ task.fileName, img, task.callback, task.callback_userPtr });
+		}
+	}
+}
+
+static void loadImageAsync(CStr fileName, LoadImageCallback callback, void* callback_userPtr)
+{
+	std::lock_guard l(vk.loadTasks_mutex);
+	vk.loadTasks.push_back({ fileName, callback, callback_userPtr });
+	vk.loadTasks_condVar.notify_one();
+}
+
+static void recordCmds_doPendingQueueTransferTasks(VkCommandBuffer cmdBuffer)
+{
+	std::lock_guard l(vk.queueTransferTasks_mutex);
+	if (vk.queueTransferTasks.empty())
+		return;
+
+	std::vector<VkImageMemoryBarrier> imgBarriers(vk.queueTransferTasks.size());
+	for (size_t i = 0; i < vk.queueTransferTasks.size(); i++) {
+		imgBarriers[i] = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = vk.queueFamily_transfer,
+			.dstQueueFamilyIndex = vk.queueFamily_main,
+			.image = vk.queueTransferTasks[i].img.img,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+	}
+
+	vkCmdPipelineBarrier(cmdBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0,
+		0, nullptr,
+		0, nullptr,
+		imgBarriers.size(), imgBarriers.data());
+
+	for (const auto& task : vk.queueTransferTasks) {
+		task.callback(task.callback_userPtr, task.fileName, task.img);
+	}
+	vk.queueTransferTasks.resize(0);
 }
 
 int main()
@@ -167,6 +335,10 @@ int main()
 
 	VkResult vkRes;
 
+	u32 maxVulkanVersion;
+	vkEnumerateInstanceVersion(&maxVulkanVersion);
+	const u32 vulkanVersion = glm::min(MY_VULKAN_VERSION, maxVulkanVersion);
+
 	{ // create vulkan instance
 		std::vector<CStr> instanceExtensions;
 		u32 numExtensions;
@@ -179,7 +351,7 @@ int main()
 			instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 		#endif
 
-		vk.instance = vkh::createInstance(MY_VULKAN_VERSION, {}, instanceExtensions, "example");
+		vk.instance = vkh::createInstance(vulkanVersion, {}, instanceExtensions, "example");
 
 		#ifdef ENABLE_DEBUG_MESSENGER
 			const VkDebugUtilsMessengerCreateInfoEXT debugUtilsCreateInfo = {
@@ -239,7 +411,8 @@ int main()
 		};
 		const u32 numCreateQueues = vk.queueFamily_transfer >= 0 ? 2 : 1;
 
-		ConstStr extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+		//vkEnumerateDeviceExtensionProperties(vk.physicalDevice, )
+		ConstStr extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,  };
 		vk.device = vkh::createDevice(vk.physicalDevice, { createQueues, numCreateQueues }, extensions);
 
 		vkGetDeviceQueue(vk.device, vk.queueFamily_main, 0, &vk.queue_main);
@@ -253,7 +426,7 @@ int main()
 		.physicalDevice = vk.physicalDevice,
 		.device = vk.device,
 		.instance = vk.instance,
-		.vulkanApiVersion = MY_VULKAN_VERSION,
+		.vulkanApiVersion = vulkanVersion,
 	};
 	vkRes = vmaCreateAllocator(&allocatorInfo, &vk.allocator);
 	vkh::assertRes(vkRes);
@@ -296,6 +469,8 @@ int main()
 		vk.descSetLayout_object = vkh::createDescriptorSetLayout(vk.device, objectDescSet_bindings);
 	}
 
+	vk.delayedDestrMan_descSet.init(vk.swapchain.numImages);
+
 	// create pipeline layout
 	const VkDescriptorSetLayout descSetLayouts[] = { vk.descSetLayout_camera, vk.descSetLayout_object };
 	vk.pipelineLayout = vkh::createPipelineLayout(vk.device, descSetLayouts, {});
@@ -322,7 +497,7 @@ int main()
 	};
 	const VkPipelineColorBlendAttachmentState attachmentBlendInfos[] = { {
 		.blendEnable = VK_FALSE,
-		.colorWriteMask = ALL_COLOR_COMPONENTS,
+		.colorWriteMask = vkh::ALL_COLOR_COMPONENTS,
 	} };
 	const VkDynamicState dynamicStates[] = {
 		VK_DYNAMIC_STATE_VIEWPORT,
@@ -376,7 +551,8 @@ int main()
 		vmaFlushAllocation(vk.allocator, vk.stagingBuffer.alloc, stagingBuffer_offset, sizeof(blackPixel));
 		stagingBuffer_offset += sizeof(blackPixel);
 
-		recordCmds_copyBufferToImageAndPerformTransitions(vk.cmdBuffers_draw[0], vk.blackImg.img, vk.stagingBuffer.buffer, 1, 1);
+		recordCmds_copyBufferToImage(vk.cmdBuffers_draw[0], vk.blackImg.img, vk.stagingBuffer.buffer, 1, 1);
+		recordCmd_transitionImageLayoutToShaderReadOnlyOptimal(vk.cmdBuffers_draw[0], vk.blackImg.img);
 	}
 
 	auto initCopyToBuffer = [&](const Buffer& buffer, CSpan<u8> data)
@@ -406,10 +582,10 @@ int main()
 		auto& cmdBuffer = vk.cmdBuffers_draw[0];
 		// create vertex buffer
 		const Vert verts[] = {
-			{{-1, +1}, {0, 0}},
-			{{+1, +1}, {1, 0}},
-			{{+1, -1}, {1, 1}},
-			{{-1, -1}, {0, 1}},
+			{{-1, -1}, {0, 0}},
+			{{-1, +1}, {0, 1}},
+			{{+1, +1}, {1, 1}},
+			{{+1, -1}, {1, 0}},
 		};
 		auto& vertBuffer = vk.quad.vertBuffer;
 		vkh::createVertexBuffer(vk.device, vk.allocator, sizeof(verts), vertBuffer.buffer, vertBuffer.alloc, &vertBuffer.allocInfo);
@@ -417,8 +593,8 @@ int main()
 
 		// create index buffer
 		const u32 inds[] = {
-			0, 1, 2,
-			0, 2, 3
+			0, 1, 3,
+			1, 2, 3
 		};
 		auto& indBuffer = vk.quad.indBuffer;
 		vkh::createIndexBuffer(vk.device, vk.allocator, sizeof(inds), indBuffer.buffer, indBuffer.alloc, &indBuffer.allocInfo);
@@ -442,14 +618,14 @@ int main()
 		const VkDescriptorPoolSize sizes[] = {
 			{
 				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.descriptorCount = 2,
+				.descriptorCount = 2048,
 			},
 			{
 				.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-				.descriptorCount = 1,
+				.descriptorCount = 1024,
 			},
 		};
-		vk.descPool = vkh::createDescriptorPool(vk.device, 2, sizes);
+		vk.descPool = vkh::createDescriptorPool(vk.device, 1024, sizes);
 	}
 
 	// create sampler
@@ -508,12 +684,41 @@ int main()
 	vkRes = vkWaitForFences(vk.device, 1, &fence, VK_FALSE, -1);
 	vkh::assertRes(vkRes);
 
+	Image tentImg = {};
+
+	vk.loaderThread = std::thread(loaderThreadFn);
+
+	loadImageAsync("data/tent.jpg", +[](void* userPtr, CStr fileName, const Image& img) {
+		auto& tentImg = *(Image*)userPtr;
+		tentImg = img;
+
+		vk.delayedDestrMan_descSet.destroy(vk.descSet_objectParams); // queue for destruction
+
+		VkResult vkRes = vkh::allocDescSets(vk.device, vk.descPool, { &vk.descSetLayout_object, 1 }, { &vk.descSet_objectParams, 1 });
+		vkh::assertRes(vkRes);
+
+		const vkh::DescSetWriteBuffer bufferDescWrites[] = { {
+			.descSet = vk.descSet_objectParams,
+			.binding = 0,
+			.buffer = vk.uniformBuffer_objectParams.buffer,
+		} };
+		const vkh::DescSetWriteTexture textureDescWrites[] = { {
+			.descSet = vk.descSet_objectParams,
+			.binding = 1,
+			.imgView = tentImg.view,
+			.sampler = vk.sampler,
+		} };
+		vkh::writeDescriptorSets(vk.device, bufferDescWrites, textureDescWrites);
+	}, &tentImg);
+
 	u32 frameInd = 0;
 	while (!glfwWindowShouldClose(vk.window))
 	{
 		glfwPollEvents();
 		int screenW, screenH;
 		glfwGetFramebufferSize(vk.window, &screenW, &screenH);
+		if (screenW == 0 || screenH == 0)
+			continue;
 
 		u32 swapchainImageInd;
 		vkRes = vkAcquireNextImageKHR(vk.device, vk.swapchain.swapchain, -1,
@@ -524,12 +729,18 @@ int main()
 			vk.framebuffers[swapchainImageInd] = vkh::createFramebuffer(vk.device, vk.renderPass, { &vk.swapchain.imageViews[swapchainImageInd], 1 }, screenW, screenH);
 		}
 
+		vk.delayedDestrMan_descSet.startFrame([](const VkDescriptorSet& descSet) {
+			vkFreeDescriptorSets(vk.device, vk.descPool, 1, &descSet);
+		});
+
 		vkWaitForFences(vk.device, 1, &vk.fence_queueWorkFinished[swapchainImageInd], VK_FALSE, -1);
 		vkResetFences(vk.device, 1, &vk.fence_queueWorkFinished[swapchainImageInd]);
 		auto& drawCmdBuffer = vk.cmdBuffers_draw[swapchainImageInd];
 		vkh::beginCmdBuffer(drawCmdBuffer, true);
 		{
-			const VkClearValue clearVals[] = { {
+			recordCmds_doPendingQueueTransferTasks(drawCmdBuffer);
+
+			const VkClearValue clearVals[] = {{
 				.color = {0, 0.05, 0, 1},
 			} };
 			vkh::cmdBeginRenderPass(drawCmdBuffer, vk.renderPass, vk.framebuffers[swapchainImageInd], screenW, screenH, clearVals);
@@ -566,4 +777,12 @@ int main()
 
 		frameInd = (frameInd + 1) % vk.swapchain.numImages;
 	}
+
+	{
+		std::lock_guard l(vk.loadTasks_mutex);
+		vk.loadTasks_condVar.notify_one();
+		vk.terminateLoaderThread = true;
+	}
+	vk.loaderThread.join();
+	
 }

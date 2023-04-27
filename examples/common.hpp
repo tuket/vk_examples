@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <span>
 #include <vector>
+#include <unordered_set>
 #include <glm/glm.hpp>
 #include <vma.h>
 
@@ -34,8 +35,6 @@ using glm::mat4;
 namespace
 {
 
-const auto ALL_COLOR_COMPONENTS = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
 bool loadBinaryFile(CStr fileName, std::vector<u8>& buffer)
 {
 	FILE* file = fopen(fileName, "rb");
@@ -52,8 +51,42 @@ bool loadBinaryFile(CStr fileName, std::vector<u8>& buffer)
 	return true;
 }
 
+// images (and other resources) might be requested to be destroyed while still in use because of frames in flight
+// this vector has (at least) an entry for each frame in flight. We won't perform the actual destruction until we have been N frames without using the image
+// we could potentially "rescue" images that were requested to be destroyed but are needed again
+template<typename ResourceHandle>
+struct DelayedResourceDestructionManager {
+	std::vector<std::unordered_set<ResourceHandle>> resourcesToDestroy;
+	u32 curFrame = 0;
+
+	void init(u32 maxFrames) {
+		resourcesToDestroy.resize(maxFrames);
+	}
+
+	template<typename DestroyFn>
+	void startFrame(const DestroyFn& destroyFn)
+	{
+		curFrame = (curFrame + 1) % resourcesToDestroy.size();
+		for (ResourceHandle h : resourcesToDestroy[curFrame])
+			destroyFn(h);
+		resourcesToDestroy[curFrame].clear();
+	}
+
+	void destroy(ResourceHandle h)
+	{
+		resourcesToDestroy[curFrame].insert(h);
+	}
+	void rescue(ResourceHandle h)
+	{
+		for (auto& R : resourcesToDestroy)
+			R.erase(h);
+	}
+};
+
 namespace vkh
 {
+
+const auto ALL_COLOR_COMPONENTS = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
 struct Swapchain {
 	static constexpr u32 MAX_IMAGES = 16;
@@ -770,7 +803,7 @@ struct ImgInfo {
 	u32 width = 1;
 	u32 height = 1;
 	u32 layers = 1;
-	u32 mipLevels = -1;
+	u32 mipLevels = u32(-1);
 	VkFormat format = VK_FORMAT_R8G8B8A8_SRGB;
 };
 

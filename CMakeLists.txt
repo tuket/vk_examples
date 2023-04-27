@@ -21,6 +21,7 @@ add_custom_target(shaders_target DEPENDS ${spirv_files})
 add_subdirectory(libs/glm)
 add_subdirectory(libs/vma)
 add_subdirectory(libs/glfw)
-set(COMMON_LIBS glm vma glfw)
+add_subdirectory(libs/stb)
+set(COMMON_LIBS glm vma glfw stb)
 
 add_subdirectory(examples/async_load_image)
